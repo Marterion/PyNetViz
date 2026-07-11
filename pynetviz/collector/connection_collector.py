@@ -1,0 +1,317 @@
+from __future__ import annotations
+
+import logging
+import socket
+import threading
+import time
+from collections import Counter, defaultdict, deque
+from datetime import datetime, timedelta
+from typing import Callable, Optional
+
+import psutil
+
+from pynetviz.collector.bandwidth_tracker import BandwidthTracker
+from pynetviz.models.connection import (
+    ConnectionDirection,
+    ConnectionRecord,
+    DashboardStats,
+    ProcessSummary,
+    RowHighlight,
+)
+from pynetviz.services.dns_resolver import DNSResolver
+
+logger = logging.getLogger(__name__)
+
+# How long to keep disconnected rows visible (CLOSING highlight) before drop.
+CLOSING_TTL_S = 3.0
+
+
+def _format_addr(addr) -> tuple[str, int]:
+    if not addr:
+        return "", 0
+    ip = addr.ip if hasattr(addr, "ip") else str(addr[0])
+    port = addr.port if hasattr(addr, "port") else int(addr[1])
+    if ip in ("0.0.0.0", "::"):
+        try:
+            ip = socket.gethostname()
+            ip = socket.gethostbyname(ip)
+        except OSError:
+            pass
+    return ip, port
+
+
+def _infer_direction(local_port: int, remote_addr: str, remote_port: int, state: str) -> ConnectionDirection:
+    state_upper = (state or "").upper()
+    if state_upper == "LISTEN":
+        return ConnectionDirection.LISTEN
+    if remote_addr in ("", "0.0.0.0", "::", "*") or remote_port == 0:
+        return ConnectionDirection.LISTEN
+    if local_port < remote_port and state_upper in {"ESTABLISHED", "SYN_SENT"}:
+        return ConnectionDirection.OUTBOUND
+    if remote_port < local_port and state_upper == "ESTABLISHED":
+        return ConnectionDirection.INBOUND
+    if state_upper in {"SYN_RECV", "ESTABLISHED"}:
+        return ConnectionDirection.INBOUND
+    return ConnectionDirection.UNKNOWN
+
+
+class ConnectionCollector:
+    """Background collector polling psutil for live network connections."""
+
+    def __init__(
+        self,
+        poll_interval: float = 0.4,
+        on_update: Optional[Callable[[list[ConnectionRecord], DashboardStats, list[ProcessSummary]], None]] = None,
+    ) -> None:
+        self.poll_interval = poll_interval
+        self.on_update = on_update
+        self.dns = DNSResolver()
+        self.bandwidth = BandwidthTracker()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._connections: dict[str, ConnectionRecord] = {}
+        self._connection_bytes: dict[str, tuple[int, int]] = {}
+        self._process_cache: dict[int, tuple[str, str]] = {}
+        self._connection_history: deque[tuple[datetime, int]] = deque(maxlen=300)
+        self._permission_warning: Optional[str] = None
+        self._process_io_totals: dict[int, tuple[int, int]] = defaultdict(lambda: (0, 0))
+        self._closing_since: dict[str, datetime] = {}
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="ConnectionCollector", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=3)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                records, stats, processes = self._collect()
+                if self.on_update:
+                    self.on_update(records, stats, processes)
+            except Exception:
+                logger.exception("Collector poll failed")
+            self._stop.wait(self.poll_interval)
+
+    def _get_process_info(self, pid: int) -> tuple[str, str, bool]:
+        if pid <= 0:
+            return "System", "", True
+        if pid in self._process_cache:
+            name, path = self._process_cache[pid]
+            return name, path, False
+        try:
+            proc = psutil.Process(pid)
+            name = proc.name()
+            try:
+                path = proc.exe()
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                path = ""
+            self._process_cache[pid] = (name, path)
+            return name, path, False
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return f"PID {pid}", "", True
+
+    def _collect(self) -> tuple[list[ConnectionRecord], DashboardStats, list[ProcessSummary]]:
+        now = datetime.now()
+        self.bandwidth.update()
+        current_keys: set[str] = set()
+        permission_errors = 0
+        raw_connections = []
+
+        for kind in ("inet",):
+            try:
+                raw_connections.extend(psutil.net_connections(kind=kind))
+            except psutil.AccessDenied:
+                permission_errors += 1
+            except Exception as exc:
+                logger.warning("net_connections failed: %s", exc)
+
+        if permission_errors:
+            self._permission_warning = (
+                "Limited visibility: run as administrator/root for full connection data."
+            )
+        else:
+            self._permission_warning = None
+
+        active_pids: set[int] = set()
+        process_conn_counts: Counter[int] = Counter()
+        process_byte_totals: dict[int, list[int]] = defaultdict(lambda: [0, 0])
+        pid_io_delta: dict[int, tuple[int, int]] = {}
+
+        for conn in raw_connections:
+            pid = conn.pid or 0
+            active_pids.add(pid)
+            local_addr, local_port = _format_addr(conn.laddr)
+            remote_addr, remote_port = _format_addr(conn.raddr)
+            protocol = "TCP" if conn.type == socket.SOCK_STREAM else "UDP"
+            state = conn.status if conn.status else ("NONE" if protocol == "UDP" else "UNKNOWN")
+            direction = _infer_direction(local_port, remote_addr, remote_port, state)
+
+            key = f"{pid}|{protocol}|{local_addr}:{local_port}|{remote_addr}:{remote_port}|{state}"
+            current_keys.add(key)
+            process_conn_counts[pid] += 1
+
+            process_name, executable_path, is_unknown = self._get_process_info(pid)
+
+            prev_bytes = self._connection_bytes.get(key, (0, 0))
+            if pid > 0:
+                if pid not in pid_io_delta:
+                    try:
+                        io = psutil.Process(pid).io_counters()
+                        pid_io_delta[pid] = self.bandwidth.update_process_io(
+                            pid, io.write_bytes, io.read_bytes
+                        )
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        pid_io_delta[pid] = (0, 0)
+                delta_sent, delta_recv = pid_io_delta[pid]
+                share = 1 / max(process_conn_counts[pid], 1)
+                sent = prev_bytes[0] + int(delta_sent * share)
+                recv = prev_bytes[1] + int(delta_recv * share)
+            else:
+                sent, recv = prev_bytes
+
+            self._connection_bytes[key] = (sent, recv)
+            process_byte_totals[pid][0] += sent
+            process_byte_totals[pid][1] += recv
+
+            hostname = self.dns.get(remote_addr) if remote_addr else ""
+
+            prev = self._connections.get(key)
+            highlight = RowHighlight.NEW if prev is None else RowHighlight.NONE
+
+            record = ConnectionRecord(
+                pid=pid,
+                process_name=process_name,
+                executable_path=executable_path,
+                local_addr=local_addr,
+                local_port=local_port,
+                remote_addr=remote_addr,
+                remote_port=remote_port,
+                protocol=protocol,
+                state=state,
+                direction=direction,
+                hostname=hostname,
+                last_seen=now,
+                bytes_sent=sent,
+                bytes_recv=recv,
+                is_unknown_process=is_unknown,
+                highlight=highlight,
+                connection_key=key,
+            )
+            record.row_color = record.compute_row_color()
+            self._connections[key] = record
+
+        # Mark disappeared sockets as CLOSING, then drop after TTL so the
+        # table does not grow without bound on long-running sessions.
+        for key in current_keys:
+            self._closing_since.pop(key, None)
+
+        stale_keys = set(self._connections) - current_keys
+        for key in list(stale_keys):
+            record = self._connections[key]
+            first = self._closing_since.get(key)
+            if first is None:
+                self._closing_since[key] = now
+                record.highlight = RowHighlight.CLOSING
+                record.last_seen = now
+            elif (now - first).total_seconds() >= CLOSING_TTL_S:
+                del self._connections[key]
+                self._closing_since.pop(key, None)
+                self._connection_bytes.pop(key, None)
+            else:
+                record.highlight = RowHighlight.CLOSING
+
+        self.bandwidth.prune_processes(active_pids)
+        stale_byte_keys = set(self._connection_bytes) - set(self._connections)
+        for key in stale_byte_keys:
+            del self._connection_bytes[key]
+        # Bound process name/path cache to currently active sockets
+        if len(self._process_cache) > len(active_pids) + 16:
+            for pid in list(self._process_cache.keys()):
+                if pid not in active_pids:
+                    del self._process_cache[pid]
+
+        records = list(self._connections.values())
+        records.sort(key=lambda r: r.last_seen, reverse=True)
+
+        self._connection_history.append((now, len(current_keys)))
+        cutoff = now - timedelta(seconds=300)
+        while self._connection_history and self._connection_history[0][0] < cutoff:
+            self._connection_history.popleft()
+        self.bandwidth.trim_history()
+
+        listening = sum(1 for k in current_keys if self._connections[k].state.upper() == "LISTEN")
+        established = sum(
+            1 for k in current_keys if self._connections[k].state.upper() == "ESTABLISHED"
+        )
+
+        proc_counter: Counter[str] = Counter()
+        for k in current_keys:
+            proc_counter[self._connections[k].process_name] += 1
+
+        stats = DashboardStats(
+            total_connections=len(current_keys),
+            listening_ports=listening,
+            established_connections=established,
+            upload_bps=self.bandwidth.upload_bps,
+            download_bps=self.bandwidth.download_bps,
+            top_processes=proc_counter.most_common(5),
+            connection_history=list(self._connection_history),
+            bandwidth_history=list(self.bandwidth.bandwidth_history),
+            permission_warning=self._permission_warning,
+        )
+
+        processes: list[ProcessSummary] = []
+        for pid, count in sorted(process_conn_counts.items(), key=lambda x: x[1], reverse=True):
+            name, path, _ = self._get_process_info(pid)
+            cpu = 0.0
+            mem_mb = 0.0
+            if pid > 0:
+                try:
+                    proc = psutil.Process(pid)
+                    cpu = proc.cpu_percent(interval=None)
+                    mem_mb = proc.memory_info().rss / (1024 * 1024)
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    pass
+            totals = process_byte_totals[pid]
+            processes.append(
+                ProcessSummary(
+                    pid=pid,
+                    name=name,
+                    executable_path=path,
+                    connection_count=count,
+                    bytes_sent=totals[0],
+                    bytes_recv=totals[1],
+                    cpu_percent=cpu,
+                    memory_mb=mem_mb,
+                )
+            )
+
+        return records, stats, processes
+
+    def get_process_detail(self, pid: int) -> dict:
+        if pid <= 0:
+            return {"pid": 0, "name": "System", "path": "", "cpu": 0.0, "memory_mb": 0.0}
+        try:
+            proc = psutil.Process(pid)
+            with proc.oneshot():
+                return {
+                    "pid": pid,
+                    "name": proc.name(),
+                    "path": proc.exe() if hasattr(proc, "exe") else "",
+                    "cpu": proc.cpu_percent(interval=None),
+                    "memory_mb": proc.memory_info().rss / (1024 * 1024),
+                    "status": proc.status(),
+                    "username": proc.username() if hasattr(proc, "username") else "",
+                    "create_time": datetime.fromtimestamp(proc.create_time()).isoformat(),
+                    "num_threads": proc.num_threads(),
+                }
+        except (psutil.AccessDenied, psutil.NoSuchProcess) as exc:
+            return {"pid": pid, "error": str(exc)}
