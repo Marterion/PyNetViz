@@ -6,7 +6,6 @@ Desktop app that shows live sockets, groups them by process, scores risk, and ru
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![Version](https://img.shields.io/badge/Version-2.0.0-blue)
-![License](https://img.shields.io/badge/License-MIT-green)
 
 ## Features
 
@@ -155,7 +154,3 @@ PyNetViz/
 - [requests](https://requests.readthedocs.io/) — optional enrichment HTTP  
 - [geoip2](https://github.com/maxmind/GeoIP2-python) — optional MaxMind reader  
 - [Pillow](https://python-pillow.org/) + [pystray](https://github.com/moses-palmer/pystray) — system tray  
-
-## License
-
-MIT — see the repository license for terms.
