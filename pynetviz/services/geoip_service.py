@@ -16,6 +16,7 @@ class GeoIPService:
     def __init__(self, db_path: Optional[str] = None) -> None:
         self._reader = None
         self._lock = threading.Lock()
+        self.allow_external = True  # privacy mode can disable API fallback
         self._init_reader(db_path)
 
     def _init_reader(self, db_path: Optional[str]) -> None:
@@ -56,6 +57,13 @@ class GeoIPService:
                 except Exception:
                     pass
 
+        if not self.allow_external:
+            return {
+                "ip": ip,
+                "country": "Unavailable",
+                "city": "Strict privacy mode",
+                "source": "blocked",
+            }
         return self._lookup_api(ip)
 
     def _lookup_api(self, ip: str) -> dict:

@@ -145,9 +145,26 @@ class ConnectionCollector:
         process_byte_totals: dict[int, list[int]] = defaultdict(lambda: [0, 0])
         pid_io_delta: dict[int, tuple[int, int]] = {}
 
+        # First pass: count connections per PID so IO share is stable.
         for conn in raw_connections:
             pid = conn.pid or 0
             active_pids.add(pid)
+            process_conn_counts[pid] += 1
+
+        # Prefetch IO once per PID (not once per connection).
+        for pid in active_pids:
+            if pid <= 0:
+                continue
+            try:
+                io = psutil.Process(pid).io_counters()
+                pid_io_delta[pid] = self.bandwidth.update_process_io(
+                    pid, io.write_bytes, io.read_bytes
+                )
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                pid_io_delta[pid] = (0, 0)
+
+        for conn in raw_connections:
+            pid = conn.pid or 0
             local_addr, local_port = _format_addr(conn.laddr)
             remote_addr, remote_port = _format_addr(conn.raddr)
             protocol = "TCP" if conn.type == socket.SOCK_STREAM else "UDP"
@@ -156,21 +173,12 @@ class ConnectionCollector:
 
             key = f"{pid}|{protocol}|{local_addr}:{local_port}|{remote_addr}:{remote_port}|{state}"
             current_keys.add(key)
-            process_conn_counts[pid] += 1
 
             process_name, executable_path, is_unknown = self._get_process_info(pid)
 
             prev_bytes = self._connection_bytes.get(key, (0, 0))
             if pid > 0:
-                if pid not in pid_io_delta:
-                    try:
-                        io = psutil.Process(pid).io_counters()
-                        pid_io_delta[pid] = self.bandwidth.update_process_io(
-                            pid, io.write_bytes, io.read_bytes
-                        )
-                    except (psutil.AccessDenied, psutil.NoSuchProcess):
-                        pid_io_delta[pid] = (0, 0)
-                delta_sent, delta_recv = pid_io_delta[pid]
+                delta_sent, delta_recv = pid_io_delta.get(pid, (0, 0))
                 share = 1 / max(process_conn_counts[pid], 1)
                 sent = prev_bytes[0] + int(delta_sent * share)
                 recv = prev_bytes[1] + int(delta_recv * share)
@@ -269,16 +277,21 @@ class ConnectionCollector:
         )
 
         processes: list[ProcessSummary] = []
-        for pid, count in sorted(process_conn_counts.items(), key=lambda x: x[1], reverse=True):
+        ranked_pids = sorted(
+            process_conn_counts.items(), key=lambda x: x[1], reverse=True
+        )
+        # Cap expensive CPU/memory sampling to busiest PIDs.
+        rich_metric_pids = {pid for pid, _ in ranked_pids[:40] if pid > 0}
+        for pid, count in ranked_pids:
             name, path, _ = self._get_process_info(pid)
             cpu = 0.0
             mem_mb = 0.0
-            if pid > 0:
+            if pid in rich_metric_pids:
                 try:
                     proc = psutil.Process(pid)
                     cpu = proc.cpu_percent(interval=None)
                     mem_mb = proc.memory_info().rss / (1024 * 1024)
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
                     pass
             totals = process_byte_totals[pid]
             processes.append(

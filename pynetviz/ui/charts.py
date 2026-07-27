@@ -1,3 +1,5 @@
+"""Lightweight sparklines for ops-center charts."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -11,29 +13,46 @@ from pynetviz.ui.theme import (
     BORDER,
     SURFACE,
     SURFACE_ELEVATED,
+    SURFACE_VARIANT,
     TEXT_MUTED,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
 )
 
+# Cap sparkline segments — each bar is a Container; 90 was expensive on every paint.
+SPARK_MAX_BARS = 36
+
+
+def _downsample(values: list[float], max_n: int = SPARK_MAX_BARS) -> list[float]:
+    if len(values) <= max_n:
+        return values
+    step = len(values) / max_n
+    out: list[float] = []
+    i = 0.0
+    while len(out) < max_n:
+        idx = min(int(i), len(values) - 1)
+        out.append(values[idx])
+        i += step
+    return out
+
 
 def _sparkline_bars(
     values: list[float],
     color: str,
-    max_height: int = 72,
-    bar_width: int = 4,
+    max_height: int = 64,
+    bar_width: int = 5,
 ) -> ft.Row:
     if len(values) < 2:
         values = [0.0, 0.0]
-    window = values[-90:]
+    window = _downsample(values[-120:], SPARK_MAX_BARS)
     peak = max(window) or 1.0
     bars = [
         ft.Container(
             width=bar_width,
             height=max(int((v / peak) * max_height), 2),
-            bgcolor=color if v > 0 else TEXT_MUTED,
+            bgcolor=color if v > 0 else SURFACE_VARIANT,
             border_radius=2,
-            opacity=0.95 if v / peak > 0.15 else 0.55,
+            opacity=0.95 if v / peak > 0.12 else 0.4,
         )
         for v in window
     ]
@@ -42,46 +61,53 @@ def _sparkline_bars(
         spacing=1,
         alignment=ft.MainAxisAlignment.START,
         vertical_alignment=ft.CrossAxisAlignment.END,
-        scroll=ft.ScrollMode.AUTO,
         expand=True,
     )
 
 
 def _chart_shell(title: str, chart_content: ft.Control, subtitle: str = "") -> ft.Container:
-    header_row = ft.Row(
-        [
-            ft.Column(
-                [
-                    ft.Text(title, size=13, weight=ft.FontWeight.W_600, color=TEXT_PRIMARY),
-                    ft.Text(subtitle, size=11, color=TEXT_SECONDARY) if subtitle else ft.Container(height=0),
-                ],
-                spacing=2,
-                expand=True,
-            ),
-        ],
-        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-    )
     return ft.Container(
         content=ft.Column(
             [
-                header_row,
+                ft.Row(
+                    [
+                        ft.Container(width=3, height=14, bgcolor=ACCENT, border_radius=2),
+                        ft.Column(
+                            [
+                                ft.Text(
+                                    title.upper(),
+                                    size=11,
+                                    weight=ft.FontWeight.W_700,
+                                    color=TEXT_PRIMARY,
+                                    font_family="Consolas",
+                                ),
+                                ft.Text(subtitle, size=10, color=TEXT_MUTED)
+                                if subtitle
+                                else ft.Container(height=0),
+                            ],
+                            spacing=1,
+                            expand=True,
+                        ),
+                    ],
+                    spacing=8,
+                ),
                 ft.Container(
                     content=chart_content,
-                    height=96,
+                    height=88,
                     bgcolor=SURFACE_ELEVATED,
                     border_radius=8,
                     padding=ft.Padding.symmetric(horizontal=8, vertical=8),
                     border=ft.Border.all(1, BORDER),
                 ),
             ],
-            spacing=10,
+            spacing=8,
         ),
         bgcolor=SURFACE,
         border=ft.Border.all(1, BORDER),
-        border_radius=12,
-        padding=14,
+        border_radius=10,
+        padding=12,
         expand=True,
-        height=170,
+        height=150,
     )
 
 
@@ -93,9 +119,9 @@ def build_line_chart(
 ) -> ft.Container:
     values = [float(v) for _, v in data_points]
     if values:
-        subtitle = y_label or f"latest {int(values[-1])} · peak {int(max(values))}"
+        subtitle = y_label or f"now {int(values[-1])}  ·  peak {int(max(values))}"
     else:
-        subtitle = "waiting for samples…"
+        subtitle = "awaiting telemetry…"
     return _chart_shell(title, _sparkline_bars(values, color), subtitle)
 
 
@@ -109,18 +135,18 @@ def build_dual_bandwidth_chart(
         [
             ft.Row(
                 [
-                    ft.Container(width=12, height=3, bgcolor=ACCENT, border_radius=2),
-                    ft.Text("Upload", size=10, color=TEXT_SECONDARY),
-                    ft.Container(width=8),
-                    ft.Container(width=12, height=3, bgcolor=ACCENT_GREEN, border_radius=2),
-                    ft.Text("Download", size=10, color=TEXT_SECONDARY),
+                    ft.Container(width=10, height=3, bgcolor=ACCENT, border_radius=2),
+                    ft.Text("UP", size=9, color=TEXT_SECONDARY, font_family="Consolas"),
+                    ft.Container(width=10),
+                    ft.Container(width=10, height=3, bgcolor=ACCENT_GREEN, border_radius=2),
+                    ft.Text("DOWN", size=9, color=TEXT_SECONDARY, font_family="Consolas"),
                 ],
                 spacing=6,
             ),
-            _sparkline_bars(uploads, ACCENT, max_height=32, bar_width=3),
-            _sparkline_bars(downloads, ACCENT_GREEN, max_height=32, bar_width=3),
+            _sparkline_bars(uploads, ACCENT, max_height=28, bar_width=4),
+            _sparkline_bars(downloads, ACCENT_GREEN, max_height=28, bar_width=4),
         ],
-        spacing=6,
+        spacing=4,
         expand=True,
     )
     latest_up = uploads[-1] if uploads else 0
@@ -134,13 +160,13 @@ def build_process_mini_chart(history: Sequence[tuple[datetime, int]]) -> ft.Cont
         history = [(datetime.now(), 0), (datetime.now(), 0)]
     values = [float(count) for _, count in history]
     peak = max(values) or 1
-    subtitle = f"peak {int(peak)} · latest {int(values[-1])} · {len(history)} samples"
+    subtitle = f"peak {int(peak)} · now {int(values[-1])}"
     return ft.Container(
         content=ft.Column(
             [
-                ft.Text("Connections over time", size=11, color=TEXT_SECONDARY),
+                ft.Text("ACTIVITY", size=10, color=TEXT_MUTED, font_family="Consolas"),
                 ft.Container(
-                    content=_sparkline_bars(values, ACCENT, max_height=56, bar_width=4),
+                    content=_sparkline_bars(values, ACCENT, max_height=48, bar_width=4),
                     bgcolor=SURFACE_ELEVATED,
                     border_radius=8,
                     padding=8,
@@ -150,6 +176,6 @@ def build_process_mini_chart(history: Sequence[tuple[datetime, int]]) -> ft.Cont
             ],
             spacing=6,
         ),
-        height=120,
+        height=110,
         expand=True,
     )

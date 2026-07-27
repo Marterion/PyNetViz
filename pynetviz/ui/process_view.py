@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def encode_process_ref(pid: int, name: str) -> str:
-    """Serialize pid/name for Flet control.data (must be a simple string)."""
+    """Serialize pid/name for control.data storage."""
     return f"{int(pid)}\t{name}"
 
 
@@ -51,14 +51,7 @@ def decode_process_ref(data) -> Optional[tuple[int, str]]:
 
 
 class ProcessView:
-    """Per-process browser.
-
-    Selection is intentionally multi-path so it works inside Flet TabBarView:
-      1. Dropdown at top (always reliable)
-      2. ListTile on_click
-      3. Explicit \"View\" button on each row
-      4. Public select_process / select_by_index for tests & automation
-    """
+    """Per-process browser with list, dropdown, and detail selection."""
 
     def __init__(
         self,
@@ -179,6 +172,7 @@ class ProcessView:
             ],
             spacing=12,
             expand=True,
+            vertical_alignment=ft.CrossAxisAlignment.STRETCH,
         )
 
     # ── selection (single entry point) ───────────────────────────────────────

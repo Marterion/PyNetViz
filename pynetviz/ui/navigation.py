@@ -1,8 +1,4 @@
-"""Pure navigation / selection state — no Flet dependency.
-
-Unit-tested independently of the GUI so tab switches and process selection
-stay correct even when the UI layer is busy.
-"""
+"""Navigation and selection state."""
 
 from __future__ import annotations
 
@@ -11,10 +7,29 @@ from typing import Optional
 
 
 TAB_DASHBOARD = 0
-TAB_CONNECTIONS = 1
-TAB_PROCESSES = 2
-TAB_COUNT = 3
-TAB_NAMES = ("Dashboard", "Connections", "Processes")
+TAB_PROCESSES = 1
+TAB_SECURITY = 2
+TAB_INSIGHTS = 3
+TAB_HISTORY = 4
+TAB_SETTINGS = 5
+TAB_COUNT = 6
+TAB_NAMES = (
+    "Dashboard",
+    "Processes",
+    "Security",
+    "Insights",
+    "History",
+    "Settings",
+)
+
+TAB_ICONS = (
+    "DASHBOARD_OUTLINED",
+    "APPS_OUTLINED",
+    "SECURITY_OUTLINED",
+    "INSIGHTS_OUTLINED",
+    "HISTORY_OUTLINED",
+    "SETTINGS_OUTLINED",
+)
 
 
 @dataclass
@@ -37,14 +52,12 @@ class ProcessSelection:
 
 @dataclass
 class NavigationState:
-    """Single source of truth for which tab is active and process selection."""
-
     tab_index: int = TAB_DASHBOARD
     process: ProcessSelection = field(default_factory=ProcessSelection)
-    connection_process_filter: str = ""
+    sidebar_collapsed: bool = False
+    live_paused: bool = False
 
     def switch_tab(self, index: int) -> bool:
-        """Switch tab. Returns True if the index changed."""
         if not isinstance(index, int):
             raise TypeError("tab index must be int")
         if index < 0 or index >= TAB_COUNT:
@@ -56,11 +69,20 @@ class NavigationState:
 
     def select_process(self, pid: int, name: str) -> None:
         self.process.select(pid, name)
-        self.connection_process_filter = name
 
     def clear_process(self) -> None:
         self.process.clear()
-        self.connection_process_filter = ""
+
+    def toggle_sidebar(self) -> bool:
+        self.sidebar_collapsed = not self.sidebar_collapsed
+        return self.sidebar_collapsed
+
+    def toggle_pause(self) -> bool:
+        self.live_paused = not self.live_paused
+        return self.live_paused
+
+    def set_paused(self, paused: bool) -> None:
+        self.live_paused = bool(paused)
 
     @property
     def tab_name(self) -> str:
@@ -69,8 +91,17 @@ class NavigationState:
     def is_dashboard(self) -> bool:
         return self.tab_index == TAB_DASHBOARD
 
-    def is_connections(self) -> bool:
-        return self.tab_index == TAB_CONNECTIONS
-
     def is_processes(self) -> bool:
         return self.tab_index == TAB_PROCESSES
+
+    def is_security(self) -> bool:
+        return self.tab_index == TAB_SECURITY
+
+    def is_insights(self) -> bool:
+        return self.tab_index == TAB_INSIGHTS
+
+    def is_history(self) -> bool:
+        return self.tab_index == TAB_HISTORY
+
+    def is_settings(self) -> bool:
+        return self.tab_index == TAB_SETTINGS

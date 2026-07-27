@@ -28,5 +28,9 @@ Desktop.ini
 data/
 *.mmdb
 
-# Flet
+# UI framework cache
 .flet/
+
+# Local tooling / editor state
+.grok/
+*.local.md

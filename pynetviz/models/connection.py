@@ -47,6 +47,9 @@ class ConnectionRecord:
     highlight: RowHighlight = RowHighlight.NONE
     row_color: str = ""
     connection_key: str = ""
+    # Analysis fields (filled by RiskEngine; default keeps port-only heuristic)
+    risk_score: int = 0
+    risk_reasons: list[str] = field(default_factory=list)
 
     @property
     def local_endpoint(self) -> str:
@@ -60,12 +63,18 @@ class ConnectionRecord:
 
     @property
     def is_suspicious(self) -> bool:
+        """True if elevated risk score or legacy port/unknown flags."""
+        if self.risk_score >= 55:
+            return True
         ports = {self.local_port, self.remote_port}
-        return bool(ports & SUSPICIOUS_PORTS)
+        return bool(ports & SUSPICIOUS_PORTS) or self.is_unknown_process
 
     def compute_row_color(self) -> str:
-        if self.is_suspicious or self.is_unknown_process:
+        port_hit = bool({self.local_port, self.remote_port} & SUSPICIOUS_PORTS)
+        if self.risk_score >= 75 or self.is_unknown_process or port_hit:
             return "#E53935"
+        if self.risk_score >= 55:
+            return "#FB8C00"
         state_upper = self.state.upper()
         if state_upper == "LISTEN":
             return "#42A5F5"

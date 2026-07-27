@@ -4,4 +4,3 @@ requests>=2.31.0
 geoip2>=4.8.0
 Pillow>=10.0.0
 pystray>=0.19.5
-matplotlib>=3.8.0

@@ -66,10 +66,26 @@ class SystemTray:
         self._thread = threading.Thread(target=self._icon.run, kwargs={"setup": setup}, daemon=True)
         self._thread.start()
 
-    def update_stats(self, connection_count: int) -> None:
+    def update_stats(self, connection_count: int, *, unread_alerts: int = 0) -> None:
         self._connection_count = connection_count
         if self._icon:
-            self._icon.title = f"{self.app_name} — {connection_count} active connections"
+            alert_bit = f" · {unread_alerts} alert{'s' if unread_alerts != 1 else ''}" if unread_alerts else ""
+            self._icon.title = (
+                f"{self.app_name} — {connection_count} active connections{alert_bit}"
+            )
+
+    def notify_alert(self, title: str, body: str = "") -> None:
+        """Best-effort tray balloon; falls back to title text."""
+        if not self._icon:
+            return
+        try:
+            # pystray notify is platform-dependent
+            if hasattr(self._icon, "notify"):
+                self._icon.notify(body or title, title)
+            else:
+                self._icon.title = f"{self.app_name}: {title}"
+        except Exception:
+            logger.debug("tray notify failed", exc_info=True)
 
     def stop(self) -> None:
         if self._icon:
