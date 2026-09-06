@@ -307,17 +307,7 @@ class SettingsView:
             show_port_labels=bool(self.port_labels_switch.value),
             auto_export_dir=self._settings.auto_export_dir,
             security_enabled=bool(self.security_master.value),
-            mon_suspicious_hosts=bool(self.mon_switches["mon_suspicious_hosts"].value),
-            mon_new_device=bool(self.mon_switches["mon_new_device"].value),
-            mon_evil_twin=bool(self.mon_switches["mon_evil_twin"].value),
-            mon_system_files=bool(self.mon_switches["mon_system_files"].value),
-            mon_device_list=bool(self.mon_switches["mon_device_list"].value),
-            mon_idle_summary=bool(self.mon_switches["mon_idle_summary"].value),
-            mon_arp_spoof=bool(self.mon_switches["mon_arp_spoof"].value),
-            mon_proxy_settings=bool(self.mon_switches["mon_proxy_settings"].value),
-            mon_traffic=bool(self.mon_switches["mon_traffic"].value),
-            mon_time_machine=bool(self.mon_switches["mon_time_machine"].value),
-            mon_first_activity=bool(self.mon_switches["mon_first_activity"].value),
+            **{key: bool(sw.value) for key, sw in self.mon_switches.items()},
         )
 
     def _on_privacy_select(self, e=None) -> None:

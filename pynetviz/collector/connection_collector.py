@@ -19,11 +19,30 @@ from pynetviz.models.connection import (
     RowHighlight,
 )
 from pynetviz.services.dns_resolver import DNSResolver
+from pynetviz.utils.netaddrs import is_unspecified_addr
 
 logger = logging.getLogger(__name__)
 
 # How long to keep disconnected rows visible (CLOSING highlight) before drop.
 CLOSING_TTL_S = 3.0
+_HOST_IP_TTL_S = 30.0
+
+_cached_host_ip = ""
+_cached_host_ip_at = 0.0
+
+
+def _host_ipv4() -> str:
+    """Cached local IPv4 used to replace 0.0.0.0 / :: on listen sockets."""
+    global _cached_host_ip, _cached_host_ip_at
+    now = time.monotonic()
+    if _cached_host_ip and (now - _cached_host_ip_at) < _HOST_IP_TTL_S:
+        return _cached_host_ip
+    try:
+        _cached_host_ip = socket.gethostbyname(socket.gethostname())
+        _cached_host_ip_at = now
+    except OSError:
+        pass
+    return _cached_host_ip
 
 
 def _format_addr(addr) -> tuple[str, int]:
@@ -32,19 +51,17 @@ def _format_addr(addr) -> tuple[str, int]:
     ip = addr.ip if hasattr(addr, "ip") else str(addr[0])
     port = addr.port if hasattr(addr, "port") else int(addr[1])
     if ip in ("0.0.0.0", "::"):
-        try:
-            ip = socket.gethostname()
-            ip = socket.gethostbyname(ip)
-        except OSError:
-            pass
+        host_ip = _host_ipv4()
+        if host_ip:
+            ip = host_ip
     return ip, port
 
 
-def _infer_direction(local_port: int, remote_addr: str, remote_port: int, state: str) -> ConnectionDirection:
+def _infer_direction(
+    local_port: int, remote_addr: str, remote_port: int, state: str
+) -> ConnectionDirection:
     state_upper = (state or "").upper()
-    if state_upper == "LISTEN":
-        return ConnectionDirection.LISTEN
-    if remote_addr in ("", "0.0.0.0", "::", "*") or remote_port == 0:
+    if state_upper == "LISTEN" or is_unspecified_addr(remote_addr) or remote_port == 0:
         return ConnectionDirection.LISTEN
     if local_port < remote_port and state_upper in {"ESTABLISHED", "SYN_SENT"}:
         return ConnectionDirection.OUTBOUND
@@ -61,7 +78,9 @@ class ConnectionCollector:
     def __init__(
         self,
         poll_interval: float = 0.4,
-        on_update: Optional[Callable[[list[ConnectionRecord], DashboardStats, list[ProcessSummary]], None]] = None,
+        on_update: Optional[
+            Callable[[list[ConnectionRecord], DashboardStats, list[ProcessSummary]], None]
+        ] = None,
     ) -> None:
         self.poll_interval = poll_interval
         self.on_update = on_update
@@ -69,26 +88,28 @@ class ConnectionCollector:
         self.bandwidth = BandwidthTracker()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
-        self._lock = threading.Lock()
         self._connections: dict[str, ConnectionRecord] = {}
         self._connection_bytes: dict[str, tuple[int, int]] = {}
         self._process_cache: dict[int, tuple[str, str]] = {}
+        self._ps_procs: dict[int, psutil.Process] = {}
         self._connection_history: deque[tuple[datetime, int]] = deque(maxlen=300)
         self._permission_warning: Optional[str] = None
-        self._process_io_totals: dict[int, tuple[int, int]] = defaultdict(lambda: (0, 0))
         self._closing_since: dict[str, datetime] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="ConnectionCollector", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="ConnectionCollector", daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=3)
+        self.dns.shutdown()
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -100,14 +121,29 @@ class ConnectionCollector:
                 logger.exception("Collector poll failed")
             self._stop.wait(self.poll_interval)
 
+    def _psutil_proc(self, pid: int) -> Optional[psutil.Process]:
+        if pid <= 0:
+            return None
+        proc = self._ps_procs.get(pid)
+        if proc is not None:
+            return proc
+        try:
+            proc = psutil.Process(pid)
+            self._ps_procs[pid] = proc
+            return proc
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return None
+
     def _get_process_info(self, pid: int) -> tuple[str, str, bool]:
         if pid <= 0:
             return "System", "", True
-        if pid in self._process_cache:
-            name, path = self._process_cache[pid]
-            return name, path, False
+        cached = self._process_cache.get(pid)
+        if cached is not None:
+            return cached[0], cached[1], False
+        proc = self._psutil_proc(pid)
+        if proc is None:
+            return f"PID {pid}", "", True
         try:
-            proc = psutil.Process(pid)
             name = proc.name()
             try:
                 path = proc.exe()
@@ -116,6 +152,7 @@ class ConnectionCollector:
             self._process_cache[pid] = (name, path)
             return name, path, False
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            self._ps_procs.pop(pid, None)
             return f"PID {pid}", "", True
 
     def _collect(self) -> tuple[list[ConnectionRecord], DashboardStats, list[ProcessSummary]]:
@@ -125,43 +162,42 @@ class ConnectionCollector:
         permission_errors = 0
         raw_connections = []
 
-        for kind in ("inet",):
-            try:
-                raw_connections.extend(psutil.net_connections(kind=kind))
-            except psutil.AccessDenied:
-                permission_errors += 1
-            except Exception as exc:
-                logger.warning("net_connections failed: %s", exc)
+        try:
+            raw_connections.extend(psutil.net_connections(kind="inet"))
+        except psutil.AccessDenied:
+            permission_errors += 1
+        except Exception as exc:
+            logger.warning("net_connections failed: %s", exc)
 
-        if permission_errors:
-            self._permission_warning = (
-                "Limited visibility: run as administrator/root for full connection data."
-            )
-        else:
-            self._permission_warning = None
+        self._permission_warning = (
+            "Limited visibility: run as administrator/root for full connection data."
+            if permission_errors
+            else None
+        )
 
         active_pids: set[int] = set()
         process_conn_counts: Counter[int] = Counter()
         process_byte_totals: dict[int, list[int]] = defaultdict(lambda: [0, 0])
         pid_io_delta: dict[int, tuple[int, int]] = {}
 
-        # First pass: count connections per PID so IO share is stable.
         for conn in raw_connections:
             pid = conn.pid or 0
             active_pids.add(pid)
             process_conn_counts[pid] += 1
 
-        # Prefetch IO once per PID (not once per connection).
         for pid in active_pids:
-            if pid <= 0:
+            proc = self._psutil_proc(pid)
+            if proc is None:
+                pid_io_delta[pid] = (0, 0)
                 continue
             try:
-                io = psutil.Process(pid).io_counters()
+                io = proc.io_counters()
                 pid_io_delta[pid] = self.bandwidth.update_process_io(
                     pid, io.write_bytes, io.read_bytes
                 )
             except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
                 pid_io_delta[pid] = (0, 0)
+                self._ps_procs.pop(pid, None)
 
         for conn in raw_connections:
             pid = conn.pid or 0
@@ -171,7 +207,8 @@ class ConnectionCollector:
             state = conn.status if conn.status else ("NONE" if protocol == "UDP" else "UNKNOWN")
             direction = _infer_direction(local_port, remote_addr, remote_port, state)
 
-            key = f"{pid}|{protocol}|{local_addr}:{local_port}|{remote_addr}:{remote_port}|{state}"
+            # 5-tuple only — state changes update the same row instead of duplicating it.
+            key = f"{pid}|{protocol}|{local_addr}:{local_port}|{remote_addr}:{remote_port}"
             current_keys.add(key)
 
             process_name, executable_path, is_unknown = self._get_process_info(pid)
@@ -216,13 +253,11 @@ class ConnectionCollector:
             record.row_color = record.compute_row_color()
             self._connections[key] = record
 
-        # Mark disappeared sockets as CLOSING, then drop after TTL so the
-        # table does not grow without bound on long-running sessions.
         for key in current_keys:
             self._closing_since.pop(key, None)
 
         stale_keys = set(self._connections) - current_keys
-        for key in list(stale_keys):
+        for key in stale_keys:
             record = self._connections[key]
             first = self._closing_since.get(key)
             if first is None:
@@ -240,11 +275,13 @@ class ConnectionCollector:
         stale_byte_keys = set(self._connection_bytes) - set(self._connections)
         for key in stale_byte_keys:
             del self._connection_bytes[key]
-        # Bound process name/path cache to currently active sockets
         if len(self._process_cache) > len(active_pids) + 16:
             for pid in list(self._process_cache.keys()):
                 if pid not in active_pids:
                     del self._process_cache[pid]
+            for pid in list(self._ps_procs.keys()):
+                if pid not in active_pids:
+                    del self._ps_procs[pid]
 
         records = list(self._connections.values())
         records.sort(key=lambda r: r.last_seen, reverse=True)
@@ -255,14 +292,17 @@ class ConnectionCollector:
             self._connection_history.popleft()
         self.bandwidth.trim_history()
 
-        listening = sum(1 for k in current_keys if self._connections[k].state.upper() == "LISTEN")
-        established = sum(
-            1 for k in current_keys if self._connections[k].state.upper() == "ESTABLISHED"
-        )
-
+        listening = 0
+        established = 0
         proc_counter: Counter[str] = Counter()
         for k in current_keys:
-            proc_counter[self._connections[k].process_name] += 1
+            rec = self._connections[k]
+            state_u = rec.state.upper()
+            if state_u == "LISTEN":
+                listening += 1
+            elif state_u == "ESTABLISHED":
+                established += 1
+            proc_counter[rec.process_name] += 1
 
         stats = DashboardStats(
             total_connections=len(current_keys),
@@ -270,7 +310,7 @@ class ConnectionCollector:
             established_connections=established,
             upload_bps=self.bandwidth.upload_bps,
             download_bps=self.bandwidth.download_bps,
-            top_processes=proc_counter.most_common(5),
+            top_processes=proc_counter.most_common(10),
             connection_history=list(self._connection_history),
             bandwidth_history=list(self.bandwidth.bandwidth_history),
             permission_warning=self._permission_warning,
@@ -280,19 +320,20 @@ class ConnectionCollector:
         ranked_pids = sorted(
             process_conn_counts.items(), key=lambda x: x[1], reverse=True
         )
-        # Cap expensive CPU/memory sampling to busiest PIDs.
         rich_metric_pids = {pid for pid, _ in ranked_pids[:40] if pid > 0}
         for pid, count in ranked_pids:
             name, path, _ = self._get_process_info(pid)
             cpu = 0.0
             mem_mb = 0.0
             if pid in rich_metric_pids:
-                try:
-                    proc = psutil.Process(pid)
-                    cpu = proc.cpu_percent(interval=None)
-                    mem_mb = proc.memory_info().rss / (1024 * 1024)
-                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
-                    pass
+                proc = self._psutil_proc(pid)
+                if proc is not None:
+                    try:
+                        with proc.oneshot():
+                            cpu = proc.cpu_percent(interval=None)
+                            mem_mb = proc.memory_info().rss / (1024 * 1024)
+                    except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                        self._ps_procs.pop(pid, None)
             totals = process_byte_totals[pid]
             processes.append(
                 ProcessSummary(

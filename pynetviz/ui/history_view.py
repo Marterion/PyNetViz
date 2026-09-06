@@ -13,12 +13,10 @@ from pynetviz.ui.theme import (
     BORDER,
     SURFACE,
     SURFACE_ELEVATED,
-    SURFACE_VARIANT,
     TEXT_MUTED,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
     badge,
-    empty_state,
     section_title,
 )
 from pynetviz.utils.formatters import format_rate

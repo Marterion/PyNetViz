@@ -5,6 +5,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+from pynetviz.utils.netaddrs import is_unspecified_addr
+
 
 class ConnectionDirection(str, Enum):
     INBOUND = "inbound"
@@ -57,9 +59,14 @@ class ConnectionRecord:
 
     @property
     def remote_endpoint(self) -> str:
-        if self.remote_addr in ("", "0.0.0.0", "::", "*"):
+        if is_unspecified_addr(self.remote_addr):
             return "*:*"
         return f"{self.remote_addr}:{self.remote_port}"
+
+    @property
+    def has_remote(self) -> bool:
+        """True when this row has a real remote peer (not a listen/wildcard)."""
+        return not is_unspecified_addr(self.remote_addr)
 
     @property
     def is_suspicious(self) -> bool:

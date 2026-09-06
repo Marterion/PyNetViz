@@ -1,4 +1,4 @@
-"""Security monitoring engine — orchestrates 8 ops-center detectors."""
+"""Security monitoring engine — orchestrates ops-center detectors."""
 
 from __future__ import annotations
 
@@ -165,29 +165,9 @@ class SecurityEngine:
             "high": AlertLevel.HIGH,
         }.get(finding.level, AlertLevel.WARN)
         fp = finding.fingerprint or f"sec:{monitor_id}:{finding.title}"
-        # Prefer public helpers when present; fall back to store insert.
-        emit = getattr(self.alerts, "emit", None) or getattr(self.alerts, "_emit", None)
-        if callable(emit):
-            return emit(
-                level,
-                f"[{monitor_id}] {finding.title}",
-                finding.body,
-                fp,
-            )
-        new_id = self.alerts.store.add_alert(
-            level=level.value,
-            title=f"[{monitor_id}] {finding.title}",
-            body=finding.body,
-            fingerprint=fp,
-        )
-        if new_id is None:
-            return None
-        return Alert(
-            id=new_id,
-            ts=datetime.now().isoformat(timespec="seconds"),
-            level=level.value,
-            title=f"[{monitor_id}] {finding.title}",
-            body=finding.body,
-            fingerprint=fp,
-            read=False,
+        return self.alerts.emit(
+            level,
+            f"[{monitor_id}] {finding.title}",
+            finding.body,
+            fp,
         )

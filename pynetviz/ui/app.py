@@ -63,6 +63,15 @@ logger = logging.getLogger(__name__)
 # Dashboard/ops paints are heavier — cap UI rebuild rate (~1.5–2 Hz).
 UI_MIN_INTERVAL_S = 0.55
 
+
+class _TabsIndex:
+    """Lightweight stand-in for a tab control selected_index."""
+
+    __slots__ = ("selected_index",)
+
+    def __init__(self) -> None:
+        self.selected_index = 0
+
 _ICON_MAP = {
     "DASHBOARD_OUTLINED": ft.Icons.DASHBOARD_OUTLINED,
     "APPS_OUTLINED": ft.Icons.APPS_OUTLINED,
@@ -132,6 +141,11 @@ class PyNetVizApp:
             self.collector.poll_interval = float(settings.poll_interval_s)
         except Exception:
             pass
+        if getattr(self, "process_view", None) is not None:
+            try:
+                self.process_view.max_rows = max(20, min(500, int(settings.max_table_rows)))
+            except Exception:
+                pass
         try:
             self.security.configure(
                 enabled=settings.security_enabled,
@@ -179,6 +193,10 @@ class PyNetVizApp:
         self.collector.stop()
         try:
             self.analysis.store.prune_old(days=14)
+        except Exception:
+            pass
+        try:
+            self.analysis.store.close()
         except Exception:
             pass
         self.tray.stop()
@@ -625,13 +643,10 @@ class PyNetVizApp:
         except Exception:
             logger.exception("UI update failed")
         finally:
+            self._updating = False
             if self._pending_ui and self.page:
+                self._updating = True
                 self.page.run_task(self._update_ui_loop)
-            else:
-                self._updating = False
-                if self._pending_ui and self.page:
-                    self._updating = True
-                    self.page.run_task(self._update_ui_loop)
 
     # ── bootstrap ────────────────────────────────────────────────────────────
 
@@ -654,6 +669,7 @@ class PyNetVizApp:
         self.process_view = ProcessView(
             on_process_select=self._on_process_select,
             page=page,
+            max_rows=self.settings_store.settings.max_table_rows,
         )
         self.security_view = SecurityView()
         self.insights_view = InsightsView(on_mark_alerts_read=self._on_mark_alerts_read)
@@ -673,7 +689,7 @@ class PyNetVizApp:
             on_click=self._toggle_pause,
         )
 
-        self.tabs_control = type("TabsControl", (), {"selected_index": 0})()
+        self.tabs_control = _TabsIndex()
         _raw_tab_bodies = [
             self.dashboard.root,
             self.process_view.root,

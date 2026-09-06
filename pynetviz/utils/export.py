@@ -5,11 +5,10 @@ from __future__ import annotations
 import csv
 import io
 import json
-from dataclasses import asdict
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from pynetviz.models.connection import ConnectionRecord
 

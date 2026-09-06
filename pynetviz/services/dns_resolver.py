@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import atexit
 import socket
 import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
-_LOCAL_IPS = frozenset({"0.0.0.0", "::", "*", "127.0.0.1", "::1"})
+from pynetviz.utils.netaddrs import LOOPBACK_ADDRS, is_unspecified_addr
+
+
+def _is_local_ip(ip: str) -> bool:
+    return is_unspecified_addr(ip) or ip in LOOPBACK_ADDRS
 
 
 class DNSResolver:
-    """Reverse DNS resolver with LRU cache and non-blocking background resolution."""
+    """Reverse DNS resolver with LRU cache and a bounded worker pool."""
 
     def __init__(self, cache_size: int = 4096, timeout: float = 2.0) -> None:
         self._cache: OrderedDict[str, str] = OrderedDict()
@@ -17,6 +23,21 @@ class DNSResolver:
         self._lock = threading.Lock()
         self._cache_size = cache_size
         self._timeout = timeout
+        self._pool: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(
+            max_workers=6,
+            thread_name_prefix="pynetviz-dns",
+        )
+        atexit.register(self.shutdown)
+
+    def shutdown(self) -> None:
+        pool = self._pool
+        if pool is None:
+            return
+        self._pool = None
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
     def _store(self, ip: str, hostname: str) -> None:
         with self._lock:
@@ -26,7 +47,7 @@ class DNSResolver:
                 self._cache.popitem(last=False)
 
     def _resolve_blocking(self, ip: str) -> str:
-        if not ip or ip in _LOCAL_IPS:
+        if _is_local_ip(ip):
             return ip
         try:
             old_timeout = socket.getdefaulttimeout()
@@ -36,36 +57,34 @@ class DNSResolver:
                 return hostname
             finally:
                 socket.setdefaulttimeout(old_timeout)
-        except (socket.herror, socket.gaierror, OSError, socket.timeout):
+        except (socket.herror, socket.gaierror, OSError, socket.timeout, TimeoutError):
             return ip
 
     def _resolve_worker(self, ip: str) -> None:
-        hostname = self._resolve_blocking(ip)
-        with self._lock:
-            self._pending.discard(ip)
-        self._store(ip, hostname)
+        try:
+            hostname = self._resolve_blocking(ip)
+            self._store(ip, hostname)
+        finally:
+            with self._lock:
+                self._pending.discard(ip)
 
     def get(self, ip: str) -> str:
         """Return cached hostname immediately, or IP while resolving in background."""
-        if not ip or ip in _LOCAL_IPS:
+        if _is_local_ip(ip):
             return ip
         with self._lock:
             if ip in self._cache:
                 self._cache.move_to_end(ip)
                 return self._cache[ip]
-            if ip not in self._pending:
-                self._pending.add(ip)
-                threading.Thread(
-                    target=self._resolve_worker,
-                    args=(ip,),
-                    name=f"dns-{ip}",
-                    daemon=True,
-                ).start()
+            if ip in self._pending or self._pool is None:
+                return ip
+            self._pending.add(ip)
+            self._pool.submit(self._resolve_worker, ip)
         return ip
 
     def resolve(self, ip: str) -> str:
         """Blocking resolve — use sparingly; prefer get() in hot paths."""
-        if not ip or ip in _LOCAL_IPS:
+        if _is_local_ip(ip):
             return ip
         with self._lock:
             if ip in self._cache:
@@ -80,7 +99,11 @@ class DNSResolver:
             result = self.resolve(ip)
             callback(ip, result)
 
-        threading.Thread(target=worker, daemon=True).start()
+        pool = self._pool
+        if pool is None:
+            threading.Thread(target=worker, daemon=True).start()
+            return
+        pool.submit(worker)
 
     def clear_cache(self) -> None:
         with self._lock:

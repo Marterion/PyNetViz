@@ -87,11 +87,11 @@ class NetworkAggregates:
 
 def _dir_bucket(record: ConnectionRecord) -> str:
     d = record.direction
-    if d == ConnectionDirection.OUTBOUND or getattr(d, "value", "") == "outbound":
+    if d == ConnectionDirection.OUTBOUND:
         return "outbound"
-    if d == ConnectionDirection.INBOUND or getattr(d, "value", "") == "inbound":
+    if d == ConnectionDirection.INBOUND:
         return "inbound"
-    if d == ConnectionDirection.LISTEN or getattr(d, "value", "") == "listen":
+    if d == ConnectionDirection.LISTEN:
         return "listen"
     return "unknown"
 
@@ -149,7 +149,7 @@ def build_aggregates(
             agg.established += 1
 
         processes.add((r.process_name or f"pid:{r.pid}").lower())
-        if r.remote_addr and r.remote_addr not in ("", "0.0.0.0", "::", "*"):
+        if r.has_remote:
             key = f"{r.remote_addr}:{r.remote_port}"
             remotes[key] += 1
             remote_set.add(r.remote_addr)

@@ -46,6 +46,15 @@ class MonitorContext:
     now: datetime
     run_expensive: bool = True
     store: Any = None  # Optional AnalysisStore for time machine
+    _arp_rows: Optional[list[tuple[str, str, str]]] = field(
+        default=None, repr=False, compare=False
+    )
+
+    def arp_table(self) -> list[tuple[str, str, str]]:
+        """Parse ARP once per expensive tick and reuse across detectors."""
+        if self._arp_rows is None:
+            self._arp_rows = _parse_arp_table()
+        return self._arp_rows
 
 
 class BaseDetector(ABC):
@@ -147,7 +156,7 @@ class SuspiciousHostMonitor(BaseDetector):
         for r in ctx.records:
             if r.risk_score < 55 and not r.is_suspicious:
                 continue
-            if not r.remote_addr or r.remote_addr in ("", "0.0.0.0", "::", "*"):
+            if not r.has_remote:
                 continue
             key = f"{r.remote_addr}:{r.remote_port}"
             label = f"{r.process_name} → {key}"
@@ -189,7 +198,7 @@ class NewDeviceMonitor(BaseDetector):
     def scan(self, ctx: MonitorContext) -> ScanResult:
         if not ctx.run_expensive:
             return ScanResult("ok", "Deferred (interval)", [])
-        rows = _parse_arp_table()
+        rows = ctx.arp_table()
         macs = {mac for _, mac, _ in rows}
         findings: list[Finding] = []
         if not self._primed:
@@ -391,7 +400,7 @@ class DeviceListMonitor(BaseDetector):
                 f"Inventory {n} device(s) (cached)",
                 [],
             )
-        rows = _parse_arp_table()
+        rows = ctx.arp_table()
         self._inventory = rows
         # Surface as findings for UI list (info only, no alert spam)
         findings = [
@@ -448,6 +457,7 @@ class IdleActivityMonitor(BaseDetector):
         self._idle_remotes: set[str] = set()
         self._idle_bytes = 0
         self._idle_peak_conns = 0
+        self._idle_bytes_baseline: Optional[int] = None
 
     def _idle_seconds(self) -> float:
         if IS_WINDOWS:
@@ -484,11 +494,16 @@ class IdleActivityMonitor(BaseDetector):
                 self._idle_remotes.clear()
                 self._idle_bytes = 0
                 self._idle_peak_conns = 0
+                self._idle_bytes_baseline = None
+            attributed = 0
             for r in ctx.records:
                 self._idle_procs.add(r.process_name or f"pid:{r.pid}")
-                if r.remote_addr and r.remote_addr not in ("", "0.0.0.0", "::", "*"):
+                if r.has_remote:
                     self._idle_remotes.add(f"{r.remote_addr}:{r.remote_port}")
-                self._idle_bytes += int(r.bytes_sent or 0) + int(r.bytes_recv or 0)
+                attributed += int(r.bytes_sent or 0) + int(r.bytes_recv or 0)
+            if self._idle_bytes_baseline is None:
+                self._idle_bytes_baseline = attributed
+            self._idle_bytes = max(0, attributed - self._idle_bytes_baseline)
             self._idle_peak_conns = max(
                 self._idle_peak_conns, int(ctx.stats.total_connections or 0)
             )
@@ -541,7 +556,7 @@ class ArpSpoofMonitor(BaseDetector):
     def scan(self, ctx: MonitorContext) -> ScanResult:
         if not ctx.run_expensive:
             return ScanResult("ok", "Deferred (interval)", [])
-        rows = _parse_arp_table()
+        rows = ctx.arp_table()
         findings: list[Finding] = []
         current: dict[str, str] = {}
         for ip, mac, _ in rows:
@@ -907,7 +922,7 @@ class FirstNetworkActivityMonitor(BaseDetector):
         for r in ctx.records:
             pname = (r.process_name or f"pid:{r.pid}").lower()
             procs_now.add(pname)
-            if r.remote_addr and r.remote_addr not in ("", "0.0.0.0", "::", "*"):
+            if r.has_remote:
                 remotes_now.add(f"{r.remote_addr}:{r.remote_port}")
             if (r.state or "").upper() == "LISTEN" or (
                 hasattr(r.direction, "value") and r.direction.value == "listen"

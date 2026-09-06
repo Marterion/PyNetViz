@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import ipaddress
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
 from pynetviz.models.connection import (
@@ -13,6 +11,7 @@ from pynetviz.models.connection import (
     ConnectionDirection,
     ConnectionRecord,
 )
+from pynetviz.utils.netaddrs import is_non_public_ip
 
 # Living-off-the-land binaries that rarely need arbitrary outbound sockets
 LOLBIN_NAMES = frozenset(
@@ -60,21 +59,6 @@ class RiskEngine:
         self.elevated_threshold = elevated_threshold
 
     @staticmethod
-    def _is_private_or_local(ip: str) -> bool:
-        if not ip or ip in ("0.0.0.0", "::", "*", "127.0.0.1", "::1"):
-            return True
-        try:
-            addr = ipaddress.ip_address(ip.split("%")[0])
-            return bool(
-                addr.is_private
-                or addr.is_loopback
-                or addr.is_link_local
-                or addr.is_multicast
-            )
-        except ValueError:
-            return False
-
-    @staticmethod
     def _path_risk(path: str) -> Optional[str]:
         if not path:
             return None
@@ -97,6 +81,7 @@ class RiskEngine:
     ) -> RiskAssessment:
         score = 0
         reasons: list[str] = []
+        remote_public = not is_non_public_ip(record.remote_addr)
 
         ports = {record.local_port, record.remote_port}
         bad_ports = ports & SUSPICIOUS_PORTS
@@ -110,7 +95,7 @@ class RiskEngine:
 
         name_l = (record.process_name or "").lower()
         if name_l in LOLBIN_NAMES and record.direction == ConnectionDirection.OUTBOUND:
-            if not self._is_private_or_local(record.remote_addr):
+            if remote_public:
                 score += 30
                 reasons.append(f"LOLBin outbound ({record.process_name})")
 
@@ -122,17 +107,17 @@ class RiskEngine:
         if first_seen_process:
             score += 15
             reasons.append("new process")
-        if first_seen_remote and not self._is_private_or_local(record.remote_addr):
+        if first_seen_remote and remote_public:
             score += 18
             reasons.append("new remote host")
-        if first_seen_pair and not self._is_private_or_local(record.remote_addr):
+        if first_seen_pair and remote_public:
             score += 10
             reasons.append("new process→remote pair")
 
         if (
             record.direction == ConnectionDirection.INBOUND
             and (record.state or "").upper() == "ESTABLISHED"
-            and not self._is_private_or_local(record.remote_addr)
+            and remote_public
         ):
             score += 20
             reasons.append("inbound established")

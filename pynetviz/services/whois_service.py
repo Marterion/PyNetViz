@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import OrderedDict
 
 import requests
+
+from pynetviz.utils.netaddrs import is_non_public_ip
 
 logger = logging.getLogger(__name__)
 
@@ -11,12 +14,31 @@ logger = logging.getLogger(__name__)
 class WhoisService:
     """WHOIS lookup via public API."""
 
-    def __init__(self) -> None:
+    def __init__(self, cache_size: int = 256) -> None:
         self.allow_external = True  # privacy mode can disable remote API
+        self._lock = threading.Lock()
+        self._cache: OrderedDict[str, dict] = OrderedDict()
+        self._cache_size = cache_size
 
     def lookup(self, ip: str) -> dict:
-        if not ip or ip.startswith("127.") or ip == "::1":
+        if is_non_public_ip(ip):
             return {"ip": ip, "org": "Localhost", "country": "N/A", "source": "local"}
+
+        with self._lock:
+            cached = self._cache.get(ip)
+            if cached is not None:
+                self._cache.move_to_end(ip)
+                return cached
+
+        result = self._lookup_uncached(ip)
+        with self._lock:
+            self._cache[ip] = result
+            self._cache.move_to_end(ip)
+            while len(self._cache) > self._cache_size:
+                self._cache.popitem(last=False)
+        return result
+
+    def _lookup_uncached(self, ip: str) -> dict:
 
         if not self.allow_external:
             return {

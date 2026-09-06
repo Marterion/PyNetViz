@@ -72,62 +72,69 @@ class AnalysisPipeline:
         tick_new_procs: list[str] = []
         tick_new_remotes: list[str] = []
 
-        # Pre-scan first-seen for processes/remotes (batch)
-        proc_new: dict[str, bool] = {}
-        remote_new: dict[str, bool] = {}
-        pair_new: dict[str, bool] = {}
+        observations: list[tuple[str, str, str, str, int]] = []
+        proc_first: dict[str, ConnectionRecord] = {}
+        remote_first: dict[str, ConnectionRecord] = {}
+        pair_keys: set[str] = set()
 
         for rec in records:
             pname = rec.process_name or f"pid:{rec.pid}"
-            if pname not in proc_new:
-                hit = self.store.observe_first_seen(
-                    "process",
-                    pname.lower(),
-                    process_name=pname,
-                    now=now,
-                )
-                proc_new[pname] = hit.is_new
-                if hit.is_new:
-                    tick_new_procs.append(pname)
-                    if pname not in self.session_new_processes:
-                        self.session_new_processes.append(pname)
-                    a = self.alerts.on_new_process(pname, rec.pid)
-                    if a:
-                        new_alerts.append(a)
-
+            if pname not in proc_first:
+                proc_first[pname] = rec
+                observations.append(("process", pname.lower(), pname, "", 0))
             rkey = f"{rec.remote_addr}:{rec.remote_port}"
-            if rec.remote_addr and rec.remote_addr not in ("", "0.0.0.0", "::", "*"):
-                if rkey not in remote_new:
-                    hit = self.store.observe_first_seen(
-                        "remote",
-                        rkey,
-                        process_name=pname,
-                        remote_addr=rec.remote_addr,
-                        remote_port=rec.remote_port,
-                        now=now,
-                    )
-                    remote_new[rkey] = hit.is_new
-                    if hit.is_new:
-                        tick_new_remotes.append(rkey)
-                        if rkey not in self.session_new_remotes:
-                            self.session_new_remotes.append(rkey)
-                        a = self.alerts.on_new_remote(pname, rec.remote_addr, rec.remote_port)
-                        if a:
-                            new_alerts.append(a)
-
-            pair_key = f"{pname.lower()}|{rkey}"
-            if pair_key not in pair_new:
-                hit = self.store.observe_first_seen(
-                    "pair",
-                    pair_key,
-                    process_name=pname,
-                    remote_addr=rec.remote_addr,
-                    remote_port=rec.remote_port,
-                    now=now,
+            if rec.has_remote and rkey not in remote_first:
+                remote_first[rkey] = rec
+                observations.append(
+                    ("remote", rkey, pname, rec.remote_addr, rec.remote_port)
                 )
-                pair_new[pair_key] = hit.is_new
+            pair_key = f"{pname.lower()}|{rkey}"
+            if pair_key not in pair_keys:
+                pair_keys.add(pair_key)
+                observations.append(
+                    ("pair", pair_key, pname, rec.remote_addr, rec.remote_port)
+                )
 
-        # Risk score every record
+        hits = self.store.observe_first_seen_batch(observations, now=now)
+
+        proc_new: dict[str, bool] = {}
+        for pname, rec in proc_first.items():
+            hit = hits.get(("process", pname.lower()))
+            is_new = bool(hit and hit.is_new)
+            proc_new[pname] = is_new
+            if is_new:
+                tick_new_procs.append(pname)
+                if pname not in self.session_new_processes:
+                    self.session_new_processes.append(pname)
+                alert = self.alerts.on_new_process(pname, rec.pid)
+                if alert:
+                    new_alerts.append(alert)
+
+        remote_new: dict[str, bool] = {}
+        for rkey, rec in remote_first.items():
+            hit = hits.get(("remote", rkey))
+            is_new = bool(hit and hit.is_new)
+            remote_new[rkey] = is_new
+            if is_new:
+                tick_new_remotes.append(rkey)
+                if rkey not in self.session_new_remotes:
+                    self.session_new_remotes.append(rkey)
+                alert = self.alerts.on_new_remote(
+                    rec.process_name, rec.remote_addr, rec.remote_port
+                )
+                if alert:
+                    new_alerts.append(alert)
+
+        pair_new: dict[str, bool] = {}
+        for pair_key in pair_keys:
+            hit = hits.get(("pair", pair_key))
+            pair_new[pair_key] = bool(hit and hit.is_new)
+
+        if len(self.session_new_processes) > 40:
+            self.session_new_processes = self.session_new_processes[-40:]
+        if len(self.session_new_remotes) > 40:
+            self.session_new_remotes = self.session_new_remotes[-40:]
+
         for rec in records:
             pname = rec.process_name or f"pid:{rec.pid}"
             rkey = f"{rec.remote_addr}:{rec.remote_port}"
@@ -138,18 +145,14 @@ class AnalysisPipeline:
                 first_seen_remote=remote_new.get(rkey, False),
                 first_seen_pair=pair_new.get(pair_key, False),
             )
-            a = self.alerts.on_high_risk(rec)
-            if a:
-                new_alerts.append(a)
+            alert = self.alerts.on_high_risk(rec)
+            if alert:
+                new_alerts.append(alert)
 
         # Hourly rollup (~once per 60s check)
         if mono - self._last_hourly >= 60.0:
             self._last_hourly = mono
-            remotes = {
-                r.remote_addr
-                for r in records
-                if r.remote_addr and r.remote_addr not in ("", "0.0.0.0", "::", "*")
-            }
+            remotes = {r.remote_addr for r in records if r.has_remote}
             try:
                 self.store.record_hourly_snapshot(
                     total_connections=stats.total_connections,

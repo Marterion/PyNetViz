@@ -58,10 +58,12 @@ class ProcessView:
         on_process_select: Callable[[str, int], None],
         on_refresh: Optional[Callable[[], None]] = None,
         page: Optional[ft.Page] = None,
+        max_rows: int = 100,
     ) -> None:
         self.on_process_select = on_process_select
         self.on_refresh = on_refresh
         self.page = page
+        self.max_rows = max(20, min(500, int(max_rows)))
         self._history: dict[int, deque[tuple[datetime, int]]] = defaultdict(
             lambda: deque(maxlen=120)
         )
@@ -279,7 +281,7 @@ class ProcessView:
 
     def _list_identity(self) -> str:
         pids = ",".join(
-            str(pid) for pid in sorted(p.pid for p in self._latest_processes[:100])
+            str(pid) for pid in sorted(p.pid for p in self._latest_processes[: self.max_rows])
         )
         return f"{self._selected_pid or ''}|{pids}"
 
@@ -333,7 +335,7 @@ class ProcessView:
         )
 
     def _rebuild_dropdown(self) -> None:
-        pids = ",".join(str(p.pid) for p in self._latest_processes[:100])
+        pids = ",".join(str(p.pid) for p in self._latest_processes[: self.max_rows])
         if pids == self._dropdown_identity and self.process_dropdown.options:
             # Still refresh selected value
             if self._selected_pid is not None and self._selected_name is not None:
@@ -347,7 +349,7 @@ class ProcessView:
                 key=encode_process_ref(p.pid, p.name),
                 text=f"{p.name}  (PID {p.pid}, {p.connection_count} conn)",
             )
-            for p in self._latest_processes[:100]
+            for p in self._latest_processes[: self.max_rows]
         ]
         if self._selected_pid is not None and self._selected_name is not None:
             self.process_dropdown.value = encode_process_ref(
@@ -376,7 +378,7 @@ class ProcessView:
             return
 
         self.process_list.controls = [
-            self._make_tile(p) for p in self._latest_processes[:100]
+            self._make_tile(p) for p in self._latest_processes[: self.max_rows]
         ]
 
     # ── details panel ────────────────────────────────────────────────────────
@@ -421,7 +423,9 @@ class ProcessView:
         )
 
     def _conn_cards_identity(self, pid: int, conns: list[ConnectionRecord]) -> str:
-        return f"{pid}|" + ",".join(f"{c.connection_key}:{c.state}" for c in conns[:100])
+        return f"{pid}|" + ",".join(
+            f"{c.connection_key}:{c.state}" for c in conns[: self.max_rows]
+        )
 
     def _render_details(self, force: bool = False) -> None:
         if self._selected_pid is None:
@@ -483,7 +487,9 @@ class ProcessView:
         self._details_identity_cached = cards_id
 
         if conns:
-            self.connections_for_process.controls = [self._conn_card(c) for c in conns[:100]]
+            self.connections_for_process.controls = [
+                self._conn_card(c) for c in conns[: self.max_rows]
+            ]
         else:
             self.connections_for_process.controls = [
                 ft.Text(

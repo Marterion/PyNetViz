@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from pynetviz.utils.netaddrs import is_unspecified_addr
+
 # Curated common services — not exhaustive, UI-friendly labels.
 WELL_KNOWN_PORTS: dict[int, str] = {
     20: "FTP-Data",
@@ -107,6 +109,6 @@ def format_port(port: int, *, with_label: bool = True) -> str:
 
 def format_endpoint(addr: str, port: int, *, with_label: bool = True) -> str:
     """`8.8.8.8:443 (HTTPS)` style endpoint."""
-    if not addr or addr in ("0.0.0.0", "::", "*"):
+    if is_unspecified_addr(addr):
         return f"*:{format_port(port, with_label=with_label)}" if port else "*:*"
     return f"{addr}:{format_port(port, with_label=with_label)}"

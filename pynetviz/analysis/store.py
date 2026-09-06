@@ -10,11 +10,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path.home() / ".pynetviz" / "analysis.db"
+
+
+def _chunks(seq: Sequence, size: int) -> Iterable[Sequence]:
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
 
 
 @dataclass
@@ -33,26 +38,45 @@ class AnalysisStore:
         self.db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
         self._lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = self._connect()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
         conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA busy_timeout=5000")
+        except sqlite3.Error:
+            logger.debug("SQLite PRAGMA setup failed", exc_info=True)
         return conn
 
     @contextmanager
     def _cursor(self) -> Iterator[sqlite3.Cursor]:
         with self._lock:
-            conn = self._connect()
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("AnalysisStore is closed")
+            cur = conn.cursor()
             try:
-                cur = conn.cursor()
                 yield cur
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
-            finally:
+
+    def close(self) -> None:
+        with self._lock:
+            conn = getattr(self, "_conn", None)
+            if conn is None:
+                return
+            try:
                 conn.close()
+            except sqlite3.Error:
+                pass
+            self._conn = None  # type: ignore[assignment]
 
     def _init_db(self) -> None:
         with self._cursor() as cur:
@@ -98,6 +122,7 @@ class AnalysisStore:
                     read INTEGER DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_alerts_fingerprint ON alerts(fingerprint, ts);
                 CREATE INDEX IF NOT EXISTS idx_samples_ts ON connection_samples(ts DESC);
                 CREATE INDEX IF NOT EXISTS idx_first_seen_last ON first_seen(last_seen);
                 """
@@ -127,45 +152,100 @@ class AnalysisStore:
         now: Optional[datetime] = None,
     ) -> FirstSeenHit:
         """Upsert first-seen. is_new=True only when row did not exist."""
+        hits = self.observe_first_seen_batch(
+            [(kind, key, process_name, remote_addr, remote_port)],
+            now=now,
+        )
+        return hits[(kind, key)]
+
+    def observe_first_seen_batch(
+        self,
+        items: Sequence[tuple[str, str, str, str, int]],
+        *,
+        now: Optional[datetime] = None,
+    ) -> dict[tuple[str, str], FirstSeenHit]:
+        """Upsert many first-seen rows in one transaction.
+
+        Each item is (kind, key, process_name, remote_addr, remote_port).
+        """
+        if not items:
+            return {}
         ts = now or datetime.now()
         iso = self._iso(ts)
+        uniq: dict[tuple[str, str], tuple[str, str, str, str, int]] = {}
+        for kind, key, process_name, remote_addr, remote_port in items:
+            ident = (kind, key)
+            if ident not in uniq:
+                uniq[ident] = (kind, key, process_name, remote_addr, remote_port)
+
+        results: dict[tuple[str, str], FirstSeenHit] = {}
+        keys = list(uniq.keys())
+        existing: dict[tuple[str, str], str] = {}
         with self._cursor() as cur:
-            cur.execute(
-                "SELECT first_seen, last_seen FROM first_seen WHERE kind=? AND key=?",
-                (kind, key),
-            )
-            row = cur.fetchone()
-            if row is None:
+            for chunk in _chunks(keys, 400):
+                placeholders = ",".join("(?,?)" for _ in chunk)
+                params: list[str] = [part for pair in chunk for part in pair]
                 cur.execute(
+                    f"SELECT kind, key, first_seen FROM first_seen "
+                    f"WHERE (kind, key) IN ({placeholders})",
+                    params,
+                )
+                for row in cur.fetchall():
+                    existing[(row["kind"], row["key"])] = row["first_seen"]
+
+            inserts: list[tuple] = []
+            updates: list[tuple] = []
+            for ident, (kind, key, process_name, remote_addr, remote_port) in uniq.items():
+                first_iso = existing.get(ident)
+                if first_iso is None:
+                    inserts.append(
+                        (kind, key, iso, iso, process_name, remote_addr, remote_port)
+                    )
+                    results[ident] = FirstSeenHit(
+                        kind=kind,
+                        key=key,
+                        first_seen=ts,
+                        last_seen=ts,
+                        is_new=True,
+                    )
+                else:
+                    updates.append(
+                        (
+                            iso,
+                            process_name or None,
+                            remote_addr or None,
+                            remote_port or None,
+                            kind,
+                            key,
+                        )
+                    )
+                    results[ident] = FirstSeenHit(
+                        kind=kind,
+                        key=key,
+                        first_seen=self._parse(first_iso),
+                        last_seen=ts,
+                        is_new=False,
+                    )
+
+            if inserts:
+                cur.executemany(
                     """
                     INSERT INTO first_seen
                     (kind, key, first_seen, last_seen, process_name, remote_addr, remote_port)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (kind, key, iso, iso, process_name, remote_addr, remote_port),
+                    inserts,
                 )
-                return FirstSeenHit(
-                    kind=kind,
-                    key=key,
-                    first_seen=ts,
-                    last_seen=ts,
-                    is_new=True,
+            if updates:
+                cur.executemany(
+                    """
+                    UPDATE first_seen SET last_seen=?, process_name=COALESCE(?, process_name),
+                    remote_addr=COALESCE(?, remote_addr), remote_port=COALESCE(?, remote_port)
+                    WHERE kind=? AND key=?
+                    """,
+                    updates,
                 )
-            cur.execute(
-                """
-                UPDATE first_seen SET last_seen=?, process_name=COALESCE(?, process_name),
-                remote_addr=COALESCE(?, remote_addr), remote_port=COALESCE(?, remote_port)
-                WHERE kind=? AND key=?
-                """,
-                (iso, process_name or None, remote_addr or None, remote_port or None, kind, key),
-            )
-            return FirstSeenHit(
-                kind=kind,
-                key=key,
-                first_seen=self._parse(row["first_seen"]),
-                last_seen=ts,
-                is_new=False,
-            )
+        return results
 
     def is_known(self, kind: str, key: str) -> bool:
         with self._cursor() as cur:
@@ -278,14 +358,14 @@ class AnalysisStore:
                     for r in payload
                 ],
             )
-            # Bound table size
-            cur.execute(
-                """
-                DELETE FROM connection_samples WHERE id NOT IN (
-                    SELECT id FROM connection_samples ORDER BY id DESC LIMIT 5000
+            cur.execute("SELECT MAX(id) AS m FROM connection_samples")
+            row = cur.fetchone()
+            max_id = int(row["m"] or 0) if row else 0
+            if max_id > 5000:
+                cur.execute(
+                    "DELETE FROM connection_samples WHERE id <= ?",
+                    (max_id - 5000,),
                 )
-                """
-            )
 
     def recent_samples(self, limit: int = 40) -> list[dict]:
         """Latest stored connection samples (newest first)."""
